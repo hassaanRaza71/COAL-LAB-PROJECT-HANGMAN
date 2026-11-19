@@ -1,1629 +1,985 @@
-;=====================================================================
-;  HANGMAN  -  x86 Assembly Language (MASM + Irvine32)
-;  EL-2003 COAL Lab Project  |  Fall 2026  |  FAST-NUCES Karachi
+; ==============================================================
+;  HANGMAN GAME - x86 Assembly (MASM + Irvine32)
+;  EL-2003 COAL Lab Project - Fall 2026
 ;
-;  Group:  Muhammad Hassaan Raza  25K-0611  (Leader)
-;          Muaviyah Bin Arsalan   25K-0905
-;          Hashir Ahmed           25K-0754
+;  Muhammad Hassaan Raza   25K-0611  (Group Leader)
+;  Muaviyah Bin Arsalan    25K-0905
+;  Hashir Ahmed            25K-0754
 ;
-;  Features
-;   * Console GUI  : framed panels, arrow-key menu with highlight bar,
-;                    coloured on-screen keyboard, ASCII gallows
-;   * Windows GUI dialogs (MsgBox / MsgBoxAsk) for results & confirms
-;   * Filing       : words.txt   - editable word list (auto-created)
-;                    stats.dat   - saved statistics (binary)
-;                    history.txt - one log line per finished game
-;   * Dashboard    : win rate, scores, streaks, bar charts, recent games
-;   * Add-a-word   : new words are validated and appended to words.txt
-;
-;  Lab topics shown: data definitions, indirect & indexed addressing,
-;  2-D array (word table), loops, conditional jumps, stack & procedures,
-;  USES / PROTO / INVOKE / ADDR / LOCAL stack frames, recursion
-;  (NumToStr), SHL / MUL / DIV, string instructions (MOVSB, STOSB,
-;  SCASB, LODSB with REP/REPNE), macros, Irvine32 file I/O.
-;=====================================================================
+;  Files used by the game (same folder as the program):
+;     words.txt  - list of words, one per line (created if missing)
+;     stats.dat  - saved statistics for the dashboard
+; ==============================================================
+
 INCLUDE Irvine32.inc
 
-;---------------------------------------------------------------------
-;  Constants
-;---------------------------------------------------------------------
-MAX_WORDS    = 100          ; rows in the word table
-WORD_SIZE    = 16           ; bytes per row (15 letters + null) - keep 16 (SHL 4)
-MIN_WORD     = 3
-MAX_LIVES    = 6
-FILE_BUF     = 4096         ; words.txt read buffer
-HIST_READ    = 2000         ; bytes read from the end of history.txt
-RECENT_LINES = 5            ; games listed on the dashboard
-BAR_LEN      = 20           ; width of dashboard bar charts
-MENU_COUNT   = 5
-STATUS_ROW   = 22
+; ---------------- constants ----------------
+MAX_WORDS   = 50            ; max words we can load
+WORD_SIZE   = 16            ; each word gets 16 bytes in the word list
+MAX_LIVES   = 6
+BUFFER_SIZE = 2000          ; size of buffer used to read words.txt
+DEFAULT_COLOR      = lightGray + (black * 16)
 
-HX = 9                      ; top-left corner of the gallows art
-HY = 6
-
-ID_YES_VAL       = 6        ; value MsgBoxAsk returns for "Yes"
-MY_GENERIC_WRITE = 40000000h
-MY_SHARE_READ    = 1
-MY_OPEN_ALWAYS   = 4
-MY_ATTR_NORMAL   = 80h
-MY_FILE_END      = 2
-
-NORMAL_COLOR = lightGray + (black * 16)
-
-; Set FANCY_UI = 0 if the double-line borders look garbled on your PC
-FANCY_UI = 1
-IF FANCY_UI
-  BOX_TL = 0C9h
-  BOX_TR = 0BBh
-  BOX_BL = 0C8h
-  BOX_BR = 0BCh
-  BOX_H  = 0CDh
-  BOX_V  = 0BAh
-  HEART_CH = 03h
-  BLOCK_CH = 0DBh
-  SHADE_CH = 0B0h
-ELSE
-  BOX_TL = '+'
-  BOX_TR = '+'
-  BOX_BL = '+'
-  BOX_BR = '+'
-  BOX_H  = '-'
-  BOX_V  = '|'
-  HEART_CH = 'O'
-  BLOCK_CH = '#'
-  SHADE_CH = '.'
-ENDIF
-
-NL EQU <0Dh, 0Ah>
-
-;---------------------------------------------------------------------
-;  Macros
-;---------------------------------------------------------------------
-mPrint MACRO text:REQ               ; print a literal string
-    LOCAL txt
-    .data
-    txt BYTE text, 0
-    .code
-    push edx
-    mov  edx, OFFSET txt
-    call WriteString
-    pop  edx
-ENDM
-
-mPrintAt MACRO col:REQ, row:REQ, text:REQ   ; print a literal at (col,row)
-    LOCAL txt
-    .data
-    txt BYTE text, 0
-    .code
-    push edx
-    mov  dl, col
-    mov  dh, row
+; ---------------- macros ----------------
+; move the cursor to (column, row)
+mGoto MACRO col, row
+    mov dl, col
+    mov dh, row
     call Gotoxy
-    mov  edx, OFFSET txt
+ENDM
+
+; print a string that is defined in .data
+mPrint MACRO msg
+    mov edx, OFFSET msg
     call WriteString
-    pop  edx
 ENDM
 
-mColor MACRO clr:REQ                ; change text colour, keep EAX
-    push eax
-    mov  eax, clr
+; change the text colour
+mColor MACRO clr
+    mov eax, clr
     call SetTextColor
-    pop  eax
 ENDM
 
-;---------------------------------------------------------------------
-;  Prototypes (procedures with stack parameters)
-;---------------------------------------------------------------------
-DrawBox    PROTO, bLeft:DWORD, bTop:DWORD, bWid:DWORD, bHgt:DWORD
-CheckGuess PROTO, letter:DWORD
-AppendText PROTO, pFile:PTR BYTE, pText:PTR BYTE, nLen:DWORD
-DrawBar    PROTO, bVal:DWORD, bTot:DWORD, bClr:DWORD
 
-;=====================================================================
 .data
-;=====================================================================
-; ---------- files ----------
+; ---------------- file data ----------------
 wordsFile   BYTE "words.txt", 0
 statsFile   BYTE "stats.dat", 0
-histFile    BYTE "history.txt", 0
 fileHandle  DWORD ?
-fileBuffer  BYTE FILE_BUF DUP(0)
-histBuffer  BYTE HIST_READ + 1 DUP(0)
-lineBuf     BYTE 128 DUP(0)
-msgBuf      BYTE 256 DUP(0)
-inputBuf    BYTE 41 DUP(0)
+bytesRead   DWORD ?
+buffer      BYTE BUFFER_SIZE DUP(0)
 
-; ---------- built-in word list (also written to words.txt) ----------
-defaultWords BYTE "COMPUTER", NL, "ASSEMBLY", NL, "REGISTER", NL
-             BYTE "PROCEDURE", NL, "KEYBOARD", NL, "MEMORY", NL
-             BYTE "PROCESSOR", NL, "COMPILER", NL, "VARIABLE", NL
-             BYTE "POINTER", NL, "INTERRUPT", NL, "STACK", NL
-             BYTE "BINARY", NL, "HARDWARE", NL, "SOFTWARE", NL
-             BYTE "MONITOR", NL, "NETWORK", NL, "ALGORITHM", NL
-             BYTE "DEBUGGER", NL, "FUNCTION", NL, "SEGMENT", NL
-             BYTE "OPERAND", NL, "MACRO", NL, "INSTRUCTION", NL
-             BYTE "HEXADECIMAL", NL, "ACCUMULATOR", NL, "MICROCHIP", NL
-             BYTE "DATABASE", NL, "INTERNET", NL, "LIBRARY", NL
+; default words (used if words.txt does not exist)
+defaultWords BYTE "COMPUTER", 0Dh, 0Ah, "ASSEMBLY", 0Dh, 0Ah, "REGISTER", 0Dh, 0Ah
+             BYTE "PROCEDURE", 0Dh, 0Ah, "KEYBOARD", 0Dh, 0Ah, "MEMORY", 0Dh, 0Ah
+             BYTE "PROCESSOR", 0Dh, 0Ah, "COMPILER", 0Dh, 0Ah, "VARIABLE", 0Dh, 0Ah
+             BYTE "POINTER", 0Dh, 0Ah, "INTERRUPT", 0Dh, 0Ah, "STACK", 0Dh, 0Ah
+             BYTE "BINARY", 0Dh, 0Ah, "HARDWARE", 0Dh, 0Ah, "SOFTWARE", 0Dh, 0Ah
+             BYTE "MONITOR", 0Dh, 0Ah, "NETWORK", 0Dh, 0Ah, "ALGORITHM", 0Dh, 0Ah
+             BYTE "DEBUGGER", 0Dh, 0Ah, "FUNCTION", 0Dh, 0Ah, "SEGMENT", 0Dh, 0Ah
+             BYTE "OPERAND", 0Dh, 0Ah, "MACRO", 0Dh, 0Ah, "LIBRARY", 0Dh, 0Ah
              BYTE 0
+DEFAULT_LEN = (SIZEOF defaultWords) - 1      ; length without the last 0
 
-; ---------- 2-D word table: MAX_WORDS rows x WORD_SIZE columns ----------
-wordTable   BYTE MAX_WORDS * WORD_SIZE DUP(0)
+; ---------------- word list (2-D array: 50 rows x 16 columns) ----------------
+wordList    BYTE MAX_WORDS * WORD_SIZE DUP(0)
 wordCount   DWORD 0
-lastIndex   DWORD -1
 
-; ---------- round state ----------
-secretWord  BYTE WORD_SIZE DUP(0)
-maskWord    BYTE WORD_SIZE DUP(0)
+; ---------------- game variables ----------------
+secret      BYTE WORD_SIZE DUP(0)   ; the hidden word
+maskWord    BYTE WORD_SIZE DUP(0)   ; what the player sees, e.g. C_MP_TER
 wordLen     DWORD 0
 lives       DWORD MAX_LIVES
-guessed     BYTE 26 DUP(0)          ; 0 = unused, 1 = correct, 2 = wrong
-wrongList   BYTE 8 DUP(0)
 wrongCount  DWORD 0
-roundScore  DWORD 0
-roundResult DWORD 0                 ; 1 = win, 0 = loss
-revealMode  DWORD 0                 ; 1 = show hidden letters in red
-sessionScore DWORD 0
-statusPtr   DWORD OFFSET msgStart
-statusColor DWORD yellow
+score       DWORD 0                 ; score of the current round
+guessed     BYTE 26 DUP(0)          ; one byte per letter: 0 = not tried,
+                                    ; 1 = correct, 2 = wrong
 
-; ---------- statistics block (saved to stats.dat as one record) ----------
-statsBlock  LABEL BYTE
-gPlayed     DWORD 0
-gWins       DWORD 0
-gLosses     DWORD 0
-gTotal      DWORD 0
-gHigh       DWORD 0
-gCurStreak  DWORD 0
-gBestStreak DWORD 0
-STATS_SIZE = ($ - statsBlock)
+; ---------------- statistics (saved to stats.dat) ----------------
+statsData   LABEL DWORD
+gamesPlayed DWORD 0
+gamesWon    DWORD 0
+gamesLost   DWORD 0
+totalScore  DWORD 0
+bestScore   DWORD 0
+STATS_BYTES = 20                    ; 5 DWORDs = 20 bytes
 
-; ---------- menu ----------
-menuSel     DWORD 0
-menu1       BYTE "  [1]  Play Game             ", 0
-menu2       BYTE "  [2]  Dashboard             ", 0
-menu3       BYTE "  [3]  Add a New Word        ", 0
-menu4       BYTE "  [4]  How to Play           ", 0
-menu5       BYTE "  [5]  Exit                  ", 0
-menuTable   DWORD menu1, menu2, menu3, menu4, menu5
+; ---------------- screen frame ----------------
+lineTop     BYTE "+", 76 DUP("-"), "+", 0
+lineMid     BYTE "|", 76 DUP(" "), "|", 0
 
-ban1 BYTE " _   _    _    _   _  ____ __  __    _    _   _ ", 0
-ban2 BYTE "| | | |  / \  | \ | |/ ___|  \/  |  / \  | \ | |", 0
-ban3 BYTE "| |_| | / _ \ |  \| | |  _| |\/| | / _ \ |  \| |", 0
-ban4 BYTE "|  _  |/ ___ \| |\  | |_| | |  | |/ ___ \| |\  |", 0
-ban5 BYTE "|_| |_/_/   \_\_| \_|\____|_|  |_/_/   \_\_| \_|", 0
-bannerTable DWORD ban1, ban2, ban3, ban4, ban5
+; ---------------- menu text ----------------
+title1      BYTE "H  A  N  G  M  A  N", 0
+title2      BYTE "x86 Assembly Project  -  COAL Lab", 0
+opt1        BYTE "[1]  Play Game", 0
+opt2        BYTE "[2]  Dashboard", 0
+opt3        BYTE "[3]  How to Play", 0
+opt4        BYTE "[4]  Exit", 0
+lblLoaded   BYTE "Words loaded: ", 0
+askChoice   BYTE "Enter your choice (1-4): ", 0
+names       BYTE "Hassaan 25K-0611  |  Muaviyah 25K-0905  |  Hashir 25K-0754", 0
 
-; ---------- status messages ----------
-msgStart      BYTE "A new word has been chosen. Start guessing!", 0
-msgGood       BYTE "Good guess! That letter is in the word.", 0
-msgBad        BYTE "Wrong guess - you lost a life.", 0
-msgInvalid    BYTE "Please type a letter from A to Z.", 0
-msgAlready    BYTE "You already tried that letter - pick another one.", 0
-msgWinStatus  BYTE "*** YOU WIN! *** You guessed the word.", 0
-msgLoseStatus BYTE "*** GAME OVER *** The hangman is complete.", 0
-blankLine     BYTE 74 DUP(' '), 0
+; ---------------- game screen text ----------------
+gameTitle   BYTE "H A N G M A N", 0
+gal1        BYTE "  +-----+", 0
+gal2        BYTE "  |     |", 0
+gal3        BYTE "        |", 0
+gal4        BYTE "===========", 0
+lblWord     BYTE "SECRET WORD", 0
+lblLetters  BYTE "Letters    : ", 0
+lblLives    BYTE "Lives left : ", 0
+lblScore    BYTE "Score      : ", 0
+lblWrong    BYTE "Mistakes   : ", 0
+outOf6      BYTE " / 6", 0
+lblKeys     BYTE "LETTERS USED  (green = correct, red = wrong)", 0
+helpLine    BYTE "Type a letter to guess.   Press ESC to go back to the menu.", 0
+msgInvalid  BYTE "Please type a letter (A-Z) only.          ", 0
+msgRepeat   BYTE "You already tried that letter.            ", 0
+msgWin      BYTE "*** YOU WIN! You guessed the word. ***    ", 0
+msgLose     BYTE "*** GAME OVER! You ran out of lives. ***  ", 0
+msgAgain    BYTE "Play again? (Y/N): ", 0
 
-; ---------- dialog text ----------
-capWin    BYTE "Hangman - You Win!", 0
-capLose   BYTE "Hangman - Game Over", 0
-capQuit   BYTE "Hangman", 0
-capReset  BYTE "Reset Statistics", 0
-askQuit   BYTE "Leave this round?", NL, "It will not be counted in your statistics.", 0
-askReset  BYTE "Delete all saved statistics and game history?", 0
-rWin1     BYTE "Congratulations - you guessed it!", 0
-rLose1    BYTE "Out of lives - better luck next time.", 0
-rWordWas  BYTE NL, NL, "The word was:  ", 0
-rRound    BYTE NL, "Round score:   ", 0
-rSession  BYTE NL, "Session score: ", 0
-rAgain    BYTE NL, NL, "Play another round?", 0
+; ---------------- message boxes ----------------
+capWin      BYTE "Hangman - You Win", 0
+boxWin      BYTE "Congratulations! You guessed the word.", 0
+capLose     BYTE "Hangman - Game Over", 0
+boxLose     BYTE "Out of lives! The word is shown in red.", 0
 
-; ---------- history log pieces ----------
-hGame     BYTE "Game #", 0
-hWin      BYTE "  WIN    ", 0
-hLoss     BYTE "  LOSS   ", 0
-hScore    BYTE "Score: ", 0
-hLives    BYTE "   Lives left: ", 0
+; ---------------- dashboard text ----------------
+dashTitle   BYTE "PLAYER DASHBOARD", 0
+lblPlayed   BYTE "Games played  : ", 0
+lblWon      BYTE "Games won     : ", 0
+lblLost     BYTE "Games lost    : ", 0
+lblRate     BYTE "Win rate      : ", 0
+lblTotal    BYTE "Total score   : ", 0
+lblBest     BYTE "Best score    : ", 0
+lblBar      BYTE "Win rate bar  : [", 0
+barEnd      BYTE "]", 0
+percent     BYTE " %", 0
+savedNote   BYTE "(statistics are saved in stats.dat)", 0
+winRate     DWORD 0
 
-;=====================================================================
+; ---------------- help text ----------------
+helpTitle   BYTE "HOW TO PLAY", 0
+help1       BYTE "1. The computer picks a random word from words.txt", 0
+help2       BYTE "2. Guess the word one letter at a time", 0
+help3       BYTE "3. A correct letter is shown in all its places (+10 points)", 0
+help4       BYTE "4. A wrong letter costs one life and draws part of the hangman", 0
+help5       BYTE "5. Guess the word before you lose all 6 lives", 0
+help6       BYTE "6. Winning gives +50 bonus and +20 for every life left", 0
+help7       BYTE "You can add your own words to words.txt using Notepad.", 0
+
+msgBye      BYTE "Thanks for playing Hangman! Your statistics are saved.", 0
+
+
 .code
-;=====================================================================
+; ==============================================================
+;  MAIN
+; ==============================================================
 main PROC
-    call Randomize
-    call LoadWords
-    call LoadStats
-MainMenu:
-    call MenuScreen             ; AL = '1'..'5'
-    cmp  al, '1'
-    je   OptPlay
-    cmp  al, '2'
-    je   OptDash
-    cmp  al, '3'
-    je   OptAdd
-    cmp  al, '4'
-    je   OptHelp
-    jmp  OptExit
-OptPlay:
+    call Randomize              ; seed the random number generator
+    call LoadWords              ; read words.txt into wordList
+    call LoadStats              ; read stats.dat
+
+MenuLoop:
+    call ShowMenu               ; returns the key pressed in AL
+    cmp al, '1'
+    je  Choice1
+    cmp al, '2'
+    je  Choice2
+    cmp al, '3'
+    je  Choice3
+    cmp al, '4'
+    je  ExitGame
+    jmp MenuLoop                ; any other key: show menu again
+
+Choice1:
     call PlayGame
-    jmp  MainMenu
-OptDash:
+    jmp MenuLoop
+Choice2:
     call Dashboard
-    jmp  MainMenu
-OptAdd:
-    call AddWordScreen
-    jmp  MainMenu
-OptHelp:
-    call HelpScreen
-    jmp  MainMenu
-OptExit:
+    jmp MenuLoop
+Choice3:
+    call HowToPlay
+    jmp MenuLoop
+
+ExitGame:
     call SaveStats
-    call GoodbyeScreen
+    mColor DEFAULT_COLOR
+    call Clrscr
+    mPrint msgBye
+    call Crlf
+    call WaitMsg
     exit
 main ENDP
 
-;=====================================================================
-;                         MENU  (GUI module)
-;=====================================================================
-MenuScreen PROC USES ebx ecx edx esi
-; Draws the title screen and lets the user choose with the arrow keys
-; + ENTER, or by pressing 1-5.   Returns AL = '1'..'5'
-    mColor NORMAL_COLOR
-    call Clrscr
 
-    mColor yellow                       ; banner
-    mov  esi, OFFSET bannerTable
-    mov  ecx, LENGTHOF bannerTable
-    mov  bl, 1
-MS_Banner:
-    mov  dh, bl
-    mov  dl, 16
-    call Gotoxy
-    mov  edx, [esi]
-    call WriteString
-    add  esi, TYPE bannerTable
-    inc  bl
-    loop MS_Banner
-
-    mColor lightCyan
-    mPrintAt 20, 7, "x86 Assembly Edition  -  MASM + Irvine32"
+; ==============================================================
+;  DrawFrame - draws a border around the whole screen (rows 0-22)
+; ==============================================================
+DrawFrame PROC
     mColor lightBlue
-    INVOKE DrawBox, 23, 9, 35, 9
-    mColor gray
-    mPrintAt 18, 19, "UP / DOWN arrows + ENTER to choose   or press 1 to 5"
-    mColor lightGray
-    mPrintAt 18, 21, "Words loaded: "
-    mov  eax, wordCount
-    call WriteDec
-    mPrintAt 42, 21, "Best round score: "
-    mov  eax, gHigh
-    call WriteDec
-    mColor gray
-    mPrintAt 13, 23, "Hassaan 25K-0611  |  Muaviyah 25K-0905  |  Hashir 25K-0754"
+    mGoto 1, 0
+    mPrint lineTop
 
-MS_Redraw:
-    call DrawMenuItems
-MS_Key:
-    call ReadChar
-    cmp  al, 0Dh                        ; ENTER
-    je   MS_Enter
-    cmp  al, 1Bh                        ; ESC = Exit
-    je   MS_Esc
-    cmp  al, 0                          ; extended key (arrows)
-    je   MS_Ext
-    cmp  al, 0E0h
-    je   MS_Ext
-    cmp  al, 'w'
-    je   MS_Up
-    cmp  al, 's'
-    je   MS_Down
-    cmp  al, '1'
-    jb   MS_Key
-    cmp  al, '5'
-    ja   MS_Key
-    ret                                 ; AL already holds '1'..'5'
-MS_Ext:
-    cmp  ah, 48h                        ; up-arrow scan code
-    je   MS_Up
-    cmp  ah, 50h                        ; down-arrow scan code
-    je   MS_Down
-    jmp  MS_Key
-MS_Up:
-    cmp  menuSel, 0
-    jne  MS_UpDec
-    mov  menuSel, MENU_COUNT
-MS_UpDec:
-    dec  menuSel
-    jmp  MS_Redraw
-MS_Down:
-    inc  menuSel
-    cmp  menuSel, MENU_COUNT
-    jb   MS_Redraw
-    mov  menuSel, 0
-    jmp  MS_Redraw
-MS_Enter:
-    mov  eax, menuSel
-    add  al, '1'
-    ret
-MS_Esc:
-    mov  al, '5'
-    ret
-MenuScreen ENDP
-
-;---------------------------------------------------------------------
-DrawMenuItems PROC USES eax ebx edx
-; Draws the five menu items; the selected one gets a highlight bar.
-    mov  ebx, 0
-DMI_Loop:
-    mov  eax, ebx
-    add  eax, 11
-    mov  dh, al
-    mov  dl, 26
+    mov bl, 1                   ; BL = current row
+    mov ecx, 21                 ; 21 middle rows
+SideLoop:
+    mov dl, 1
+    mov dh, bl
     call Gotoxy
-    cmp  ebx, menuSel
-    jne  DMI_Plain
-    mov  eax, black + (lightCyan * 16)
-    jmp  DMI_Set
-DMI_Plain:
-    mov  eax, white + (black * 16)
-DMI_Set:
-    call SetTextColor
-    mov  edx, menuTable[ebx * TYPE menuTable]
+    mov edx, OFFSET lineMid
     call WriteString
-    inc  ebx
-    cmp  ebx, MENU_COUNT
-    jb   DMI_Loop
-    mColor NORMAL_COLOR
-    ret
-DrawMenuItems ENDP
+    inc bl
+    loop SideLoop
 
-;---------------------------------------------------------------------
-DrawBox PROC USES eax ecx edx, bLeft:DWORD, bTop:DWORD, bWid:DWORD, bHgt:DWORD
-; Draws a rectangular frame (width >= 3, height >= 3) in the current colour.
-    LOCAL rightCol:BYTE
-    mov  eax, bLeft
-    add  eax, bWid
-    dec  eax
-    mov  rightCol, al
-    ; top edge
-    mov  dl, BYTE PTR bLeft
-    mov  dh, BYTE PTR bTop
+    mov dl, 1
+    mov dh, bl
     call Gotoxy
-    mov  al, BOX_TL
-    call WriteChar
-    mov  ecx, bWid
-    sub  ecx, 2
-    mov  al, BOX_H
-DB_Top:
-    call WriteChar
-    loop DB_Top
-    mov  al, BOX_TR
-    call WriteChar
-    ; left and right sides
-    mov  ecx, bHgt
-    sub  ecx, 2
-    mov  dh, BYTE PTR bTop
-    mov  al, BOX_V
-DB_Side:
-    inc  dh
-    mov  dl, BYTE PTR bLeft
-    call Gotoxy
-    call WriteChar
-    mov  dl, rightCol
-    call Gotoxy
-    call WriteChar
-    loop DB_Side
-    ; bottom edge
-    inc  dh
-    mov  dl, BYTE PTR bLeft
-    call Gotoxy
-    mov  al, BOX_BL
-    call WriteChar
-    mov  ecx, bWid
-    sub  ecx, 2
-    mov  al, BOX_H
-DB_Bottom:
-    call WriteChar
-    loop DB_Bottom
-    mov  al, BOX_BR
-    call WriteChar
+    mPrint lineTop
     ret
-DrawBox ENDP
+DrawFrame ENDP
 
-;=====================================================================
-;                      GAME LOOP  (main module)
-;=====================================================================
-PlayGame PROC USES ebx edx
-PG_NewRound:
+
+; ==============================================================
+;  ShowMenu - draws the main menu
+;  Returns: AL = key pressed
+; ==============================================================
+ShowMenu PROC
+    mColor DEFAULT_COLOR
+    call Clrscr
+    call DrawFrame
+
+    mColor yellow
+    mGoto 30, 3
+    mPrint title1
+    mColor lightCyan
+    mGoto 23, 5
+    mPrint title2
+
+    mColor white
+    mGoto 32, 8
+    mPrint opt1
+    mGoto 32, 10
+    mPrint opt2
+    mGoto 32, 12
+    mPrint opt3
+    mGoto 32, 14
+    mPrint opt4
+
+    mColor lightGray
+    mGoto 32, 17
+    mPrint lblLoaded
+    mov eax, wordCount
+    call WriteDec
+
+    mColor gray
+    mGoto 10, 21
+    mPrint names
+
+    mColor yellow
+    mGoto 28, 19
+    mPrint askChoice
+    call ReadChar               ; AL = key
+    ret
+ShowMenu ENDP
+
+
+; ==============================================================
+;  PlayGame - plays rounds until the player says No
+; ==============================================================
+PlayGame PROC
+NewRound:
     call PickWord
-    call InitRound
-    call DrawGameFrame
-PG_Loop:
-    call UpdateGame
-    call ReadGuess                  ; EAX = 'A'..'Z', or 0 for ESC
-    cmp  eax, 0
-    je   PG_Abandon
-    INVOKE CheckGuess, eax
-    call IsWordComplete             ; EAX = 1 when no '_' is left
-    cmp  eax, 1
-    je   PG_Won
-    cmp  lives, 0
-    je   PG_Lost
-    jmp  PG_Loop
-PG_Won:
-    mov  roundResult, 1
-    call RecordWin
-    jmp  PG_Over
-PG_Lost:
-    mov  roundResult, 0
-    mov  revealMode, 1
-    call RecordLoss
-PG_Over:
-    call UpdateGame                 ; final board (word revealed on loss)
-    call ShowResult                 ; dialog box, EAX = Yes / No
-    cmp  eax, ID_YES_VAL
-    je   PG_NewRound
-    ret
-PG_Abandon:
-    mov  ebx, OFFSET capQuit
-    mov  edx, OFFSET askQuit
-    call MsgBoxAsk
-    cmp  eax, ID_YES_VAL
-    jne  PG_Loop
+    call InitGame
+
+GameLoop:
+    call DrawGame
+    call ReadGuess              ; AL = letter, or 0 if ESC
+    cmp al, 0
+    je  QuitGame
+    call CheckGuess
+    call CheckWin               ; EAX = 1 if word is complete
+    cmp eax, 1
+    je  PlayerWon
+    cmp lives, 0
+    je  PlayerLost
+    jmp GameLoop
+
+PlayerWon:
+    ; bonus = 50 + 20 * lives left
+    mov eax, lives
+    mov ebx, 20
+    mul ebx
+    add eax, 50
+    add score, eax
+    inc gamesWon
+    call UpdateStats
+    call DrawGame
+    mColor lightGreen
+    mGoto 4, 19
+    mPrint msgWin
+    mov ebx, OFFSET capWin
+    mov edx, OFFSET boxWin
+    call MsgBox                 ; Windows message box
+    jmp AskAgain
+
+PlayerLost:
+    inc gamesLost
+    call UpdateStats
+    call DrawGame               ; lives = 0, so the word is shown in red
+    mColor lightRed
+    mGoto 4, 19
+    mPrint msgLose
+    mov ebx, OFFSET capLose
+    mov edx, OFFSET boxLose
+    call MsgBox
+
+AskAgain:
+    mColor white
+    mGoto 4, 20
+    mPrint msgAgain
+    call ReadChar
+    cmp al, 'y'
+    je  NewRound
+    cmp al, 'Y'
+    je  NewRound
+
+QuitGame:
     ret
 PlayGame ENDP
 
-;---------------------------------------------------------------------
-PickWord PROC USES eax ecx edx esi edi
-; Copies a random row of wordTable into secretWord (never the same
-; word twice in a row) and sets wordLen.
-PW_Again:
-    mov  eax, wordCount
-    call RandomRange                ; EAX = 0 .. wordCount-1
-    cmp  wordCount, 1
-    jbe  PW_Ok
-    cmp  eax, lastIndex
-    je   PW_Again
-PW_Ok:
-    mov  lastIndex, eax
-    shl  eax, 4                     ; row * WORD_SIZE (16)
-    lea  esi, wordTable[eax]
-    mov  edi, OFFSET secretWord
-    mov  ecx, WORD_SIZE
+
+; ==============================================================
+;  PickWord - copies a random word from wordList into secret
+; ==============================================================
+PickWord PROC
+    mov eax, wordCount
+    call RandomRange            ; EAX = random number 0 .. wordCount-1
+
+    mov ebx, WORD_SIZE
+    mul ebx                     ; EAX = index * 16 = start of that row
+
+    mov esi, OFFSET wordList
+    add esi, eax                ; ESI -> chosen word
+    mov edi, OFFSET secret
+    mov ecx, WORD_SIZE
     cld
-    rep  movsb
-    mov  edx, OFFSET secretWord
-    call StrLength
-    mov  wordLen, eax
+    rep movsb                   ; copy 16 bytes
+
+    mov edx, OFFSET secret
+    call StrLength              ; EAX = length of word
+    mov wordLen, eax
     ret
 PickWord ENDP
 
-;---------------------------------------------------------------------
-InitRound PROC USES eax ecx edi
-    mov  lives, MAX_LIVES
-    mov  wrongCount, 0
-    mov  roundScore, 0
-    mov  revealMode, 0
-    cld
-    mov  al, 0
-    mov  edi, OFFSET guessed        ; clear guessed-letter record
-    mov  ecx, LENGTHOF guessed
-    rep  stosb
-    mov  edi, OFFSET wrongList
-    mov  ecx, LENGTHOF wrongList
-    rep  stosb
-    mov  edi, OFFSET maskWord       ; fill the mask with underscores
-    mov  ecx, wordLen
-    mov  al, '_'
-    rep  stosb
-    mov  BYTE PTR [edi], 0
-    mov  statusPtr, OFFSET msgStart
-    mov  statusColor, yellow
-    ret
-InitRound ENDP
 
-;---------------------------------------------------------------------
-ReadGuess PROC USES ebx edx
-; Waits for a valid, new letter.  Returns EAX = 'A'..'Z' or 0 (ESC).
-RG_Key:
-    call ReadChar
-    cmp  al, 1Bh
-    je   RG_Esc
-    cmp  al, 'a'
-    jb   RG_Upper
-    cmp  al, 'z'
-    ja   RG_Bad
-    and  al, 11011111b              ; lower -> upper case
-    jmp  RG_Letter
-RG_Upper:
-    cmp  al, 'A'
-    jb   RG_Bad
-    cmp  al, 'Z'
-    ja   RG_Bad
-RG_Letter:
-    movzx ebx, al
-    sub  ebx, 'A'
-    cmp  guessed[ebx], 0
-    jne  RG_Repeat
-    movzx eax, al
+; ==============================================================
+;  InitGame - resets everything for a new round
+; ==============================================================
+InitGame PROC
+    mov lives, MAX_LIVES
+    mov wrongCount, 0
+    mov score, 0
+
+    ; clear the guessed[] array
+    mov edi, OFFSET guessed
+    mov ecx, 26
+    mov al, 0
+    cld
+    rep stosb
+
+    ; fill maskWord with underscores
+    mov edi, OFFSET maskWord
+    mov ecx, wordLen
+    mov al, '_'
+    rep stosb
+    mov BYTE PTR [edi], 0       ; end of string
     ret
-RG_Bad:
-    mov  edx, OFFSET msgInvalid
-    mov  eax, yellow
-    call ShowStatus
-    jmp  RG_Key
-RG_Repeat:
-    mov  edx, OFFSET msgAlready
-    mov  eax, yellow
-    call ShowStatus
-    jmp  RG_Key
-RG_Esc:
-    mov  eax, 0
+InitGame ENDP
+
+
+; ==============================================================
+;  ReadGuess - reads a letter from the keyboard
+;  Returns: AL = capital letter A-Z, or AL = 0 if ESC was pressed
+; ==============================================================
+ReadGuess PROC
+ReadAgain:
+    call ReadChar
+    cmp al, 27                  ; ESC key
+    je  PressedEsc
+
+    cmp al, 'a'                 ; small letter?  convert to capital
+    jb  CheckCapital
+    cmp al, 'z'
+    ja  NotLetter
+    sub al, 32
+
+CheckCapital:
+    cmp al, 'A'
+    jb  NotLetter
+    cmp al, 'Z'
+    ja  NotLetter
+
+    movzx ebx, al               ; check if already guessed
+    sub ebx, 'A'                ; EBX = 0 for A, 1 for B ...
+    cmp guessed[ebx], 0
+    jne AlreadyTried
+    ret                         ; valid new letter in AL
+
+NotLetter:
+    push eax
+    mColor yellow
+    mGoto 4, 19
+    mPrint msgInvalid
+    pop eax
+    jmp ReadAgain
+
+AlreadyTried:
+    push eax
+    mColor yellow
+    mGoto 4, 19
+    mPrint msgRepeat
+    pop eax
+    jmp ReadAgain
+
+PressedEsc:
+    mov al, 0
     ret
 ReadGuess ENDP
 
-;---------------------------------------------------------------------
-CheckGuess PROC USES ebx ecx edx esi edi, letter:DWORD
-; Searches the secret word for the letter (REPNE SCASB).
-; Hit : reveals every matching position, +10 points each.
-; Miss: costs a life and adds the letter to the wrong list.
-    mov  eax, letter
-    movzx ebx, al
-    sub  ebx, 'A'
-    cld
-    mov  edi, OFFSET secretWord
-    mov  ecx, wordLen
-    repne scasb
-    jne  CG_Miss
-    mov  guessed[ebx], 1
-    mov  esi, 0
-    mov  ecx, wordLen
-CG_Reveal:
-    cmp  secretWord[esi], al
-    jne  CG_Next
-    mov  maskWord[esi], al
-    add  roundScore, 10
-CG_Next:
-    inc  esi
-    loop CG_Reveal
-    mov  statusPtr, OFFSET msgGood
-    mov  statusColor, lightGreen
+
+; ==============================================================
+;  CheckGuess - checks the letter in AL against the secret word
+; ==============================================================
+CheckGuess PROC
+    mov bl, 0                   ; BL = 1 if the letter is found
+    mov esi, 0
+    mov ecx, wordLen
+SearchLoop:
+    cmp secret[esi], al
+    jne NextLetter
+    mov maskWord[esi], al       ; reveal this position
+    add score, 10
+    mov bl, 1
+NextLetter:
+    inc esi
+    loop SearchLoop
+
+    movzx edx, al
+    sub edx, 'A'                ; EDX = index of the letter
+    cmp bl, 1
+    je  RightGuess
+
+    mov guessed[edx], 2         ; wrong guess
+    dec lives
+    inc wrongCount
     ret
-CG_Miss:
-    mov  guessed[ebx], 2
-    dec  lives
-    mov  edx, wrongCount
-    mov  wrongList[edx], al
-    inc  wrongCount
-    mov  statusPtr, OFFSET msgBad
-    mov  statusColor, lightRed
+
+RightGuess:
+    mov guessed[edx], 1         ; correct guess
     ret
 CheckGuess ENDP
 
-;---------------------------------------------------------------------
-IsWordComplete PROC USES ecx edi
-; Returns EAX = 1 if the mask has no '_' left, else 0.
+
+; ==============================================================
+;  CheckWin - looks for '_' in maskWord using SCASB
+;  Returns: EAX = 1 if no '_' is left (player won), else 0
+; ==============================================================
+CheckWin PROC
+    mov edi, OFFSET maskWord
+    mov ecx, wordLen
+    mov al, '_'
     cld
-    mov  edi, OFFSET maskWord
-    mov  ecx, wordLen
-    mov  al, '_'
-    repne scasb
-    je   IWC_No
-    mov  eax, 1
+    repne scasb                 ; search for '_'
+    je  NotFinished             ; found one, word not complete
+    mov eax, 1
     ret
-IWC_No:
-    mov  eax, 0
+NotFinished:
+    mov eax, 0
     ret
-IsWordComplete ENDP
+CheckWin ENDP
 
-;---------------------------------------------------------------------
-RecordWin PROC USES eax ebx edx
-; Win bonus = 50 + 20 per life left.
-    mov  eax, lives
-    mov  ebx, 20
-    mul  ebx
-    add  eax, 50
-    add  roundScore, eax
-    inc  gPlayed
-    inc  gWins
-    inc  gCurStreak
-    mov  eax, gCurStreak
-    cmp  eax, gBestStreak
-    jbe  RW_Keep
-    mov  gBestStreak, eax
-RW_Keep:
-    call AddRoundScore
-    mov  statusPtr, OFFSET msgWinStatus
-    mov  statusColor, lightGreen
-    call SaveStats
-    call LogHistory
+
+; ==============================================================
+;  UpdateStats - adds the finished round to the statistics
+; ==============================================================
+UpdateStats PROC
+    inc gamesPlayed
+    mov eax, score
+    add totalScore, eax
+    cmp eax, bestScore
+    jbe NotBest
+    mov bestScore, eax
+NotBest:
+    call SaveStats              ; save after every round
     ret
-RecordWin ENDP
+UpdateStats ENDP
 
-;---------------------------------------------------------------------
-RecordLoss PROC
-    inc  gPlayed
-    inc  gLosses
-    mov  gCurStreak, 0
-    call AddRoundScore
-    mov  statusPtr, OFFSET msgLoseStatus
-    mov  statusColor, lightRed
-    call SaveStats
-    call LogHistory
-    ret
-RecordLoss ENDP
 
-;---------------------------------------------------------------------
-AddRoundScore PROC USES eax
-    mov  eax, roundScore
-    add  gTotal, eax
-    add  sessionScore, eax
-    cmp  eax, gHigh
-    jbe  ARS_Done
-    mov  gHigh, eax
-ARS_Done:
-    ret
-AddRoundScore ENDP
-
-;---------------------------------------------------------------------
-ShowResult PROC USES ebx ecx edx esi edi
-; Builds the result text and shows a Windows Yes/No dialog.
-; Returns EAX = 6 (Yes, play again) or 7 (No).
-    cld
-    mov  edi, OFFSET msgBuf
-    mov  esi, OFFSET rWin1
-    cmp  roundResult, 1
-    je   SR_Head
-    mov  esi, OFFSET rLose1
-SR_Head:
-    call CopyStr
-    mov  esi, OFFSET rWordWas
-    call CopyStr
-    mov  esi, OFFSET secretWord
-    call CopyStr
-    mov  esi, OFFSET rRound
-    call CopyStr
-    mov  eax, roundScore
-    call NumToStr
-    mov  esi, OFFSET rSession
-    call CopyStr
-    mov  eax, sessionScore
-    call NumToStr
-    mov  esi, OFFSET rAgain
-    call CopyStr
-    mov  BYTE PTR [edi], 0
-
-    mov  ebx, OFFSET capWin
-    cmp  roundResult, 1
-    je   SR_Show
-    mov  ebx, OFFSET capLose
-SR_Show:
-    mov  edx, OFFSET msgBuf
-    call MsgBoxAsk
-    ret
-ShowResult ENDP
-
-;=====================================================================
-;                       GAME SCREEN  (display module)
-;=====================================================================
-DrawGameFrame PROC USES eax
-; Static parts of the game screen, drawn once per round.
-    mColor NORMAL_COLOR
+; ==============================================================
+;  DrawGame - draws the complete game screen
+; ==============================================================
+DrawGame PROC
+    mColor DEFAULT_COLOR
     call Clrscr
-    mColor lightBlue
-    INVOKE DrawBox, 1, 0, 78, 3         ; title bar
-    INVOKE DrawBox, 1, 4, 27, 11        ; gallows panel
-    INVOKE DrawBox, 29, 4, 50, 11       ; word panel
-    INVOKE DrawBox, 1, 16, 78, 5        ; keyboard panel
+    call DrawFrame
+
     mColor yellow
-    mPrintAt 4, 1, "H A N G M A N"
-    mColor lightGray
-    mPrintAt 30, 1, "Game #"
-    mov  eax, gPlayed
-    inc  eax
-    call WriteDec
-    mPrintAt 52, 1, "Session score: "
-    mov  eax, sessionScore
-    call WriteDec
-    mColor lightCyan
-    mPrintAt 3, 4, " GALLOWS "
-    mPrintAt 31, 4, " SECRET WORD "
-    mPrintAt 3, 16, " KEYBOARD "
-    mColor gray
-    mPrintAt 4, 23, "Type a letter (A-Z) to guess     ESC = back to menu"
-    call DrawGallows
-    mColor NORMAL_COLOR
-    ret
-DrawGameFrame ENDP
+    mGoto 32, 1
+    mPrint gameTitle
 
-;---------------------------------------------------------------------
-DrawGallows PROC
-    mColor brown
-    mPrintAt HX, HY,   "  +-----+"
-    mPrintAt HX, HY+1, "  |     |"
-    mPrintAt HX, HY+2, "        |"
-    mPrintAt HX, HY+3, "        |"
-    mPrintAt HX, HY+4, "        |"
-    mPrintAt HX, HY+5, "        |"
-    mPrintAt HX, HY+6, "==========="
-    mColor NORMAL_COLOR
-    ret
-DrawGallows ENDP
-
-;---------------------------------------------------------------------
-UpdateGame PROC USES eax edx
-; Redraws everything that changes after a guess.
     call DrawHangman
-    call DrawWordPanel
-    call DrawKeyboard
-    mov  edx, statusPtr
-    mov  eax, statusColor
-    call ShowStatus
-    ret
-UpdateGame ENDP
 
-;---------------------------------------------------------------------
-DrawHangman PROC USES eax ebx edx
-; Adds one body part per mistake (6 stages).
-    mov  ebx, MAX_LIVES
-    sub  ebx, lives                     ; EBX = mistakes made
+    ; ---- secret word ----
+    mColor lightCyan
+    mGoto 40, 4
+    mPrint lblWord
+
+    mGoto 40, 6
+    mov esi, 0
+    mov ecx, wordLen
+PrintWord:
+    mov al, maskWord[esi]
+    cmp al, '_'
+    je  Hidden
+    mColor lightGreen           ; found letter
+    mov al, maskWord[esi]
+    jmp PrintIt
+Hidden:
+    cmp lives, 0                ; game lost? then show the real letter
+    je  Reveal
+    mColor white
+    mov al, '_'
+    jmp PrintIt
+Reveal:
     mColor lightRed
-    cmp  ebx, 1
-    jb   DH_Done
-    mov  dl, HX+2                       ; head
-    mov  dh, HY+2
-    call Gotoxy
-    mov  al, 'O'
+    mov al, secret[esi]
+PrintIt:
     call WriteChar
-    cmp  ebx, 2
-    jb   DH_Done
-    mov  dl, HX+2                       ; body
-    mov  dh, HY+3
-    call Gotoxy
-    mov  al, '|'
+    mov al, ' '
     call WriteChar
-    cmp  ebx, 3
-    jb   DH_Done
-    mov  dl, HX+1                       ; left arm
-    mov  dh, HY+3
-    call Gotoxy
-    mov  al, '/'
-    call WriteChar
-    cmp  ebx, 4
-    jb   DH_Done
-    mov  dl, HX+3                       ; right arm
-    mov  dh, HY+3
-    call Gotoxy
-    mov  al, 5Ch                        ; '\'
-    call WriteChar
-    cmp  ebx, 5
-    jb   DH_Done
-    mov  dl, HX+1                       ; left leg
-    mov  dh, HY+4
-    call Gotoxy
-    mov  al, '/'
-    call WriteChar
-    cmp  ebx, 6
-    jb   DH_Done
-    mov  dl, HX+3                       ; right leg
-    mov  dh, HY+4
-    call Gotoxy
-    mov  al, 5Ch
-    call WriteChar
-DH_Done:
-    mColor lightGray
-    mPrintAt 5, 13, "Mistakes: "
-    mov  eax, ebx
+    inc esi
+    loop PrintWord
+
+    ; ---- information ----
+    mColor white
+    mGoto 40, 8
+    mPrint lblLetters
+    mov eax, wordLen
     call WriteDec
-    mPrint " / 6"
-    mColor NORMAL_COLOR
+    mGoto 40, 9
+    mPrint lblLives
+    mov eax, lives
+    call WriteDec
+    mGoto 40, 10
+    mPrint lblScore
+    mov eax, score
+    call WriteDec
+    mGoto 40, 11
+    mPrint lblWrong
+    mov eax, wrongCount
+    call WriteDec
+    mPrint outOf6
+
+    call DrawLetters
+
+    mColor gray
+    mGoto 4, 21
+    mPrint helpLine
+    mColor DEFAULT_COLOR
+    ret
+DrawGame ENDP
+
+
+; ==============================================================
+;  DrawHangman - draws the gallows and one body part per mistake
+; ==============================================================
+DrawHangman PROC
+    mColor brown
+    mGoto 8, 4
+    mPrint gal1
+    mGoto 8, 5
+    mPrint gal2
+    mGoto 8, 6
+    mPrint gal3
+    mGoto 8, 7
+    mPrint gal3
+    mGoto 8, 8
+    mPrint gal3
+    mGoto 8, 9
+    mPrint gal3
+    mGoto 8, 10
+    mPrint gal4
+
+    mColor lightRed
+    cmp wrongCount, 1
+    jb  PartsDone
+    mGoto 10, 6                 ; head
+    mov al, 'O'
+    call WriteChar
+
+    cmp wrongCount, 2
+    jb  PartsDone
+    mGoto 10, 7                 ; body
+    mov al, '|'
+    call WriteChar
+
+    cmp wrongCount, 3
+    jb  PartsDone
+    mGoto 9, 7                  ; left arm
+    mov al, '/'
+    call WriteChar
+
+    cmp wrongCount, 4
+    jb  PartsDone
+    mGoto 11, 7                 ; right arm
+    mov al, '\'
+    call WriteChar
+
+    cmp wrongCount, 5
+    jb  PartsDone
+    mGoto 9, 8                  ; left leg
+    mov al, '/'
+    call WriteChar
+
+    cmp wrongCount, 6
+    jb  PartsDone
+    mGoto 11, 8                 ; right leg
+    mov al, '\'
+    call WriteChar
+
+PartsDone:
     ret
 DrawHangman ENDP
 
-;---------------------------------------------------------------------
-DrawWordPanel PROC USES eax ebx ecx edx esi
-    ; ---- the word: green = found, white _ = hidden, red = revealed on loss
-    mov  dh, 7
-    mov  dl, 33
-    call Gotoxy
-    mov  esi, 0
-    mov  ecx, wordLen
-WP_Letter:
-    mov  al, maskWord[esi]
-    cmp  al, '_'
-    je   WP_Hidden
-    mColor lightGreen
-    jmp  WP_Out
-WP_Hidden:
-    cmp  revealMode, 1
-    jne  WP_Under
-    mColor lightRed
-    mov  al, secretWord[esi]
-    jmp  WP_Out
-WP_Under:
-    mColor white
-WP_Out:
-    call WriteChar
-    mov  al, ' '
-    call WriteChar
-    inc  esi
-    loop WP_Letter
 
-    ; ---- info lines
-    mColor lightGray
-    mPrintAt 33, 9, "Letters : "
-    mov  eax, wordLen
-    call WriteDec
-    mPrintAt 33, 10, "Lives   : "
-    mov  ebx, 0
-WP_Heart:
-    cmp  ebx, lives
-    jae  WP_Lost
-    mColor lightRed
-    mov  al, HEART_CH
-    jmp  WP_HOut
-WP_Lost:
-    mColor gray
-    mov  al, '-'
-WP_HOut:
-    call WriteChar
-    mov  al, ' '
-    call WriteChar
-    inc  ebx
-    cmp  ebx, MAX_LIVES
-    jb   WP_Heart
-
-    mColor lightGray
-    mPrintAt 33, 11, "Score   : "
-    mov  eax, roundScore
-    call WriteDec
-    mPrintAt 33, 12, "Wrong   : "
-    mColor lightRed
-    mov  ecx, wrongCount
-    jecxz WP_Done
-    mov  esi, 0
-WP_Wrong:
-    mov  al, wrongList[esi]
-    call WriteChar
-    mov  al, ' '
-    call WriteChar
-    inc  esi
-    loop WP_Wrong
-WP_Done:
-    mColor NORMAL_COLOR
-    ret
-DrawWordPanel ENDP
-
-;---------------------------------------------------------------------
-DrawKeyboard PROC USES eax ebx ecx edx
-; On-screen keyboard: A-M on row 17, N-Z on row 19.
-; grey key = unused, green = correct, red = wrong.
-    mov  ebx, 0                         ; letter index 0..25
-KB_Loop:
-    mov  eax, ebx
-    mov  ecx, 13
-    xor  edx, edx
-    div  ecx                            ; EAX = row (0/1), EDX = column
-    shl  eax, 1
-    add  eax, 17
-    lea  ecx, [edx + edx*4]             ; column * 5
-    add  ecx, 10
-    mov  dh, al
-    mov  dl, cl
-    call Gotoxy
-    movzx eax, guessed[ebx]
-    cmp  eax, 1
-    je   KB_Good
-    cmp  eax, 2
-    je   KB_Bad
-    mov  eax, black + (lightGray * 16)
-    jmp  KB_Set
-KB_Good:
-    mov  eax, white + (green * 16)
-    jmp  KB_Set
-KB_Bad:
-    mov  eax, white + (red * 16)
-KB_Set:
-    call SetTextColor
-    mov  al, ' '
-    call WriteChar
-    mov  al, bl
-    add  al, 'A'
-    call WriteChar
-    mov  al, ' '
-    call WriteChar
-    inc  ebx
-    cmp  ebx, 26
-    jb   KB_Loop
-    mColor NORMAL_COLOR
-    ret
-DrawKeyboard ENDP
-
-;---------------------------------------------------------------------
-ShowStatus PROC USES eax edx
-; EDX = message offset, EAX = colour.  Clears and rewrites the status line.
-    push edx
-    push eax
-    mov  eax, NORMAL_COLOR
-    call SetTextColor
-    mov  dh, STATUS_ROW
-    mov  dl, 2
-    call Gotoxy
-    mov  edx, OFFSET blankLine
-    call WriteString
-    mov  dh, STATUS_ROW
-    mov  dl, 4
-    call Gotoxy
-    pop  eax
-    call SetTextColor
-    pop  edx
-    call WriteString
-    mov  eax, NORMAL_COLOR
-    call SetTextColor
-    ret
-ShowStatus ENDP
-
-;=====================================================================
-;                          DASHBOARD
-;=====================================================================
-Dashboard PROC USES eax ebx ecx edx esi
-DSH_Start:
-    mColor NORMAL_COLOR
-    call Clrscr
-    mColor lightBlue
-    INVOKE DrawBox, 1, 0, 78, 3
-    INVOKE DrawBox, 1, 4, 37, 12
-    INVOKE DrawBox, 40, 4, 39, 12
-    INVOKE DrawBox, 1, 17, 78, 7
-    mColor yellow
-    mPrintAt 4, 1, "PLAYER DASHBOARD"
-    mColor gray
-    mPrintAt 42, 1, "saved in stats.dat and history.txt"
+; ==============================================================
+;  DrawLetters - shows A to Z like a keyboard
+;  grey = not tried, green = correct, red = wrong
+; ==============================================================
+DrawLetters PROC
     mColor lightCyan
-    mPrintAt 3, 4, " STATISTICS "
-    mPrintAt 42, 4, " PERFORMANCE "
-    mPrintAt 3, 17, " RECENT GAMES "
+    mGoto 6, 13
+    mPrint lblKeys
 
-    ; ---------------- left panel: numbers ----------------
-    mColor white
-    mPrintAt 4, 6, "Games played   : "
-    mov  eax, gPlayed
-    call WriteDec
-    mPrintAt 4, 7, "Wins           : "
-    mov  eax, gWins
-    call WriteDec
-    mPrintAt 4, 8, "Losses         : "
-    mov  eax, gLosses
-    call WriteDec
-    mPrintAt 4, 9, "Win rate       : "
-    call CalcWinRate
-    call WriteDec
-    mov  al, 25h                        ; '%'
+    mov ebx, 0                  ; EBX = letter number (0 = A)
+    mov dl, 8                   ; column
+    mov dh, 15                  ; row
+    mov ecx, 26
+LetterLoop:
+    call Gotoxy
+
+    cmp guessed[ebx], 1
+    je  GreenKey
+    cmp guessed[ebx], 2
+    je  RedKey
+    mColor black + (lightGray * 16)
+    jmp ShowKey
+GreenKey:
+    mColor white + (green * 16)
+    jmp ShowKey
+RedKey:
+    mColor white + (red * 16)
+ShowKey:
+    mov al, ' '
     call WriteChar
-    mPrintAt 4, 10, "Total score    : "
-    mov  eax, gTotal
-    call WriteDec
-    mPrintAt 4, 11, "Best round     : "
-    mov  eax, gHigh
-    call WriteDec
-    mPrintAt 4, 12, "Average / game : "
-    mov  eax, 0
-    cmp  gPlayed, 0
-    je   DSH_Avg
-    mov  eax, gTotal
-    xor  edx, edx
-    div  gPlayed
-DSH_Avg:
-    call WriteDec
-    mPrintAt 4, 13, "Current streak : "
-    mov  eax, gCurStreak
-    call WriteDec
-    mPrintAt 4, 14, "Best streak    : "
-    mov  eax, gBestStreak
-    call WriteDec
-
-    ; ---------------- right panel: bar charts ----------------
-    mColor white
-    mPrintAt 43, 6, "Wins   "
-    INVOKE DrawBar, gWins, gPlayed, lightGreen
-    mPrint " "
-    mov  eax, gWins
-    call WriteDec
-    mPrintAt 43, 8, "Losses "
-    INVOKE DrawBar, gLosses, gPlayed, lightRed
-    mPrint " "
-    mov  eax, gLosses
-    call WriteDec
-    mPrintAt 43, 10, "Rate   "
-    call CalcWinRate
-    INVOKE DrawBar, eax, 100, yellow
-    mPrint " "
-    call CalcWinRate
-    call WriteDec
-    mov  al, 25h
+    mov al, 'A'
+    add al, bl                  ; letter = 'A' + number
     call WriteChar
-    mColor lightGray
-    mPrintAt 43, 12, "Words in list : "
-    mov  eax, wordCount
-    call WriteDec
-    mPrintAt 43, 13, "Session score : "
-    mov  eax, sessionScore
+    mov al, ' '
+    call WriteChar
+
+    add dl, 5                   ; next column
+    inc ebx
+    cmp ebx, 13                 ; after M go to the second row
+    jne SameRow
+    mov dl, 8
+    mov dh, 17
+SameRow:
+    loop LetterLoop
+
+    mColor DEFAULT_COLOR
+    ret
+DrawLetters ENDP
+
+
+; ==============================================================
+;  Dashboard - shows the saved statistics
+; ==============================================================
+Dashboard PROC
+    mColor DEFAULT_COLOR
+    call Clrscr
+    call DrawFrame
+
+    mColor yellow
+    mGoto 31, 2
+    mPrint dashTitle
+
+    ; win rate = gamesWon * 100 / gamesPlayed
+    mov winRate, 0
+    cmp gamesPlayed, 0
+    je  ShowNumbers             ; avoid dividing by zero
+    mov eax, gamesWon
+    mov ebx, 100
+    mul ebx
+    div gamesPlayed
+    mov winRate, eax
+
+ShowNumbers:
+    mColor white
+    mGoto 20, 5
+    mPrint lblPlayed
+    mov eax, gamesPlayed
     call WriteDec
 
-    ; ---------------- bottom panel: last games from history.txt -------
-    call ShowRecentHistory
+    mGoto 20, 7
+    mPrint lblWon
+    mov eax, gamesWon
+    call WriteDec
+
+    mGoto 20, 9
+    mPrint lblLost
+    mov eax, gamesLost
+    call WriteDec
+
+    mGoto 20, 11
+    mPrint lblRate
+    mov eax, winRate
+    call WriteDec
+    mPrint percent
+
+    mGoto 20, 13
+    mPrint lblTotal
+    mov eax, totalScore
+    call WriteDec
+
+    mGoto 20, 15
+    mPrint lblBest
+    mov eax, bestScore
+    call WriteDec
+
+    ; ---- bar: one '#' for every 5 percent (20 characters = 100%) ----
+    mGoto 20, 17
+    mPrint lblBar
+    mov eax, winRate
+    mov edx, 0
+    mov ebx, 5
+    div ebx                     ; EAX = number of '#'
+    mov ebx, eax                ; save it
+
+    mColor lightGreen
+    mov ecx, ebx
+    cmp ecx, 0
+    je  EmptyPart
+FillLoop:
+    mov al, '#'
+    call WriteChar
+    loop FillLoop
+
+EmptyPart:
+    mColor gray
+    mov ecx, 20
+    sub ecx, ebx
+    cmp ecx, 0
+    je  BarDone
+EmptyLoop:
+    mov al, '-'
+    call WriteChar
+    loop EmptyLoop
+
+BarDone:
+    mColor white
+    mPrint barEnd
 
     mColor gray
-    mPrintAt 4, 24, "R = reset statistics          any other key = back to menu"
-    mColor NORMAL_COLOR
+    mGoto 20, 19
+    mPrint savedNote
 
-    call ReadChar
-    cmp  al, 'r'
-    je   DSH_Reset
-    cmp  al, 'R'
-    je   DSH_Reset
+    mColor DEFAULT_COLOR
+    mGoto 20, 21
+    call WaitMsg
     ret
-DSH_Reset:
-    mov  ebx, OFFSET capReset
-    mov  edx, OFFSET askReset
-    call MsgBoxAsk
-    cmp  eax, ID_YES_VAL
-    jne  DSH_Start
-    call ClearStats
-    call SaveStats
-    mov  edx, OFFSET histFile           ; truncate history.txt
-    call CreateOutputFile
-    cmp  eax, INVALID_HANDLE_VALUE
-    je   DSH_Start
-    call CloseFile
-    jmp  DSH_Start
 Dashboard ENDP
 
-;---------------------------------------------------------------------
-CalcWinRate PROC USES ebx edx
-; Returns EAX = wins * 100 / played  (0 if no games yet)
-    mov  eax, 0
-    cmp  gPlayed, 0
-    je   CW_Done
-    mov  eax, gWins
-    mov  ebx, 100
-    mul  ebx
-    div  gPlayed
-CW_Done:
-    ret
-CalcWinRate ENDP
 
-;---------------------------------------------------------------------
-DrawBar PROC USES eax ebx ecx edx, bVal:DWORD, bTot:DWORD, bClr:DWORD
-; Draws a BAR_LEN-wide bar: filled part = bVal * BAR_LEN / bTot
-    mov  eax, 0
-    cmp  bTot, 0
-    je   DBR_Have
-    mov  eax, bVal
-    mov  ebx, BAR_LEN
-    mul  ebx
-    div  bTot
-DBR_Have:
-    mov  ebx, eax                       ; EBX = filled cells
-    mov  eax, bClr
-    call SetTextColor
-    mov  ecx, ebx
-    jecxz DBR_Rest
-    mov  al, BLOCK_CH
-DBR_Fill:
-    call WriteChar
-    loop DBR_Fill
-DBR_Rest:
-    mov  eax, gray
-    call SetTextColor
-    mov  ecx, BAR_LEN
-    sub  ecx, ebx
-    jecxz DBR_Done
-    mov  al, SHADE_CH
-DBR_Empty:
-    call WriteChar
-    loop DBR_Empty
-DBR_Done:
-    mColor NORMAL_COLOR
-    ret
-DrawBar ENDP
-
-;---------------------------------------------------------------------
-ShowRecentHistory PROC USES eax ebx ecx edx esi
-; Reads the tail of history.txt and prints the last RECENT_LINES lines.
-    LOCAL hFile:DWORD
-    mov  edx, OFFSET histFile
-    call OpenInputFile
-    cmp  eax, INVALID_HANDLE_VALUE
-    je   RH_None
-    mov  hFile, eax
-    ; jump to HIST_READ bytes before the end (fails harmlessly if smaller)
-    INVOKE SetFilePointer, hFile, -HIST_READ, 0, MY_FILE_END
-    mov  eax, hFile
-    mov  edx, OFFSET histBuffer
-    mov  ecx, HIST_READ
-    call ReadFromFile
-    jc   RH_CloseNone
-    mov  ebx, eax                       ; bytes read
-    mov  histBuffer[ebx], 0
-    mov  eax, hFile
-    call CloseFile
-    mov  ecx, ebx
-RH_Trim:                                ; drop trailing CR / LF
-    cmp  ecx, 0
-    je   RH_None
-    mov  al, histBuffer[ecx-1]
-    cmp  al, 0Ah
-    je   RH_TrimOne
-    cmp  al, 0Dh
-    je   RH_TrimOne
-    jmp  RH_Trimmed
-RH_TrimOne:
-    dec  ecx
-    jmp  RH_Trim
-RH_Trimmed:
-    mov  histBuffer[ecx], 0
-    mov  edx, 0                         ; line feeds found so far
-RH_Back:                                ; walk backwards counting lines
-    cmp  ecx, 0
-    je   RH_Print
-    cmp  histBuffer[ecx-1], 0Ah
-    jne  RH_Prev
-    inc  edx
-    cmp  edx, RECENT_LINES
-    je   RH_Print
-RH_Prev:
-    dec  ecx
-    jmp  RH_Back
-RH_Print:
-    lea  esi, histBuffer[ecx]
-    mColor lightGray
-    mov  dh, 18
-    mov  dl, 4
-    call PrintLinesAt
-    mColor NORMAL_COLOR
-    ret
-RH_CloseNone:
-    mov  eax, hFile
-    call CloseFile
-RH_None:
-    mColor gray
-    mPrintAt 4, 19, "No games recorded yet - play a round first."
-    mColor NORMAL_COLOR
-    ret
-ShowRecentHistory ENDP
-
-;---------------------------------------------------------------------
-PrintLinesAt PROC USES eax ebx edx esi
-; ESI = text, DH = first row, DL = left column.  Each line starts at DL.
-    mov  bl, dl
-    call Gotoxy
-PL_Loop:
-    lodsb
-    cmp  al, 0
-    je   PL_Done
-    cmp  al, 0Dh
-    je   PL_Loop
-    cmp  al, 0Ah
-    jne  PL_Char
-    inc  dh
-    mov  dl, bl
-    call Gotoxy
-    jmp  PL_Loop
-PL_Char:
-    call WriteChar
-    jmp  PL_Loop
-PL_Done:
-    ret
-PrintLinesAt ENDP
-
-;=====================================================================
-;                       ADD WORD / HELP / EXIT
-;=====================================================================
-AddWordScreen PROC USES eax ebx ecx edx esi edi
-    mColor NORMAL_COLOR
+; ==============================================================
+;  HowToPlay - instructions screen
+; ==============================================================
+HowToPlay PROC
+    mColor DEFAULT_COLOR
     call Clrscr
-    mColor lightBlue
-    INVOKE DrawBox, 1, 0, 78, 3
-    INVOKE DrawBox, 10, 6, 60, 9
+    call DrawFrame
+
     mColor yellow
-    mPrintAt 4, 1, "ADD A NEW WORD"
-    mColor lightGray
-    mPrintAt 13, 8, "Words must be 3 to 15 letters (A to Z only)."
-    mPrintAt 13, 9, "The word is saved permanently in words.txt"
-    mPrintAt 13, 11, "New word: "
+    mGoto 33, 2
+    mPrint helpTitle
+
     mColor white
-    mov  edx, OFFSET inputBuf
-    mov  ecx, SIZEOF inputBuf - 1
-    call ReadString                     ; EAX = length typed
-    cmp  eax, MIN_WORD
-    jb   AW_BadLen
-    cmp  eax, WORD_SIZE - 1
-    ja   AW_BadLen
+    mGoto 8, 5
+    mPrint help1
+    mGoto 8, 7
+    mPrint help2
+    mGoto 8, 9
+    mPrint help3
+    mGoto 8, 11
+    mPrint help4
+    mGoto 8, 13
+    mPrint help5
+    mGoto 8, 15
+    mPrint help6
+    mColor lightCyan
+    mGoto 8, 18
+    mPrint help7
 
-    mov  ecx, eax                       ; validate + convert to upper case
-    mov  esi, OFFSET inputBuf
-AW_Check:
-    mov  al, [esi]
-    cmp  al, 'a'
-    jb   AW_Upper
-    cmp  al, 'z'
-    ja   AW_BadChar
-    sub  al, 32
-    mov  [esi], al
-    jmp  AW_Next
-AW_Upper:
-    cmp  al, 'A'
-    jb   AW_BadChar
-    cmp  al, 'Z'
-    ja   AW_BadChar
-AW_Next:
-    inc  esi
-    loop AW_Check
-
-    cmp  wordCount, MAX_WORDS
-    jae  AW_Full
-
-    mov  ebx, 0                         ; duplicate check
-AW_Dup:
-    cmp  ebx, wordCount
-    jae  AW_Add
-    mov  esi, ebx
-    shl  esi, 4
-    add  esi, OFFSET wordTable
-    INVOKE Str_compare, ADDR inputBuf, esi
-    je   AW_Exists
-    inc  ebx
-    jmp  AW_Dup
-
-AW_Add:
-    mov  esi, OFFSET inputBuf           ; add to the table in memory
-    call ParseWordBuffer
-    cld                                 ; build CRLF + WORD + CRLF
-    mov  edi, OFFSET lineBuf
-    mov  BYTE PTR [edi], 0Dh
-    mov  BYTE PTR [edi+1], 0Ah
-    add  edi, 2
-    mov  esi, OFFSET inputBuf
-    call CopyStr
-    mov  BYTE PTR [edi], 0Dh
-    mov  BYTE PTR [edi+1], 0Ah
-    add  edi, 2
-    mov  ecx, edi
-    sub  ecx, OFFSET lineBuf
-    INVOKE AppendText, ADDR wordsFile, ADDR lineBuf, ecx
-    mColor lightGreen
-    mPrintAt 13, 13, "Saved. Words in list now: "
-    mov  eax, wordCount
-    call WriteDec
-    jmp  AW_Wait
-AW_BadLen:
-    mColor lightRed
-    mPrintAt 13, 13, "Rejected - the word must be 3 to 15 letters long."
-    jmp  AW_Wait
-AW_BadChar:
-    mColor lightRed
-    mPrintAt 13, 13, "Rejected - use the letters A to Z only."
-    jmp  AW_Wait
-AW_Full:
-    mColor lightRed
-    mPrintAt 13, 13, "Rejected - the word list is full (100 words)."
-    jmp  AW_Wait
-AW_Exists:
-    mColor lightRed
-    mPrintAt 13, 13, "That word is already in the list."
-AW_Wait:
-    mColor NORMAL_COLOR
-    mov  dh, 18
-    mov  dl, 13
-    call Gotoxy
+    mColor DEFAULT_COLOR
+    mGoto 8, 21
     call WaitMsg
     ret
-AddWordScreen ENDP
+HowToPlay ENDP
 
-;---------------------------------------------------------------------
-HelpScreen PROC USES edx
-    mColor NORMAL_COLOR
-    call Clrscr
-    mColor lightBlue
-    INVOKE DrawBox, 1, 0, 78, 3
-    INVOKE DrawBox, 1, 4, 78, 18
-    mColor yellow
-    mPrintAt 4, 1, "HOW TO PLAY"
-    mColor lightCyan
-    mPrintAt 4, 6, "THE GAME"
-    mColor lightGray
-    mPrintAt 6, 7,  "1. A secret word is picked at random from words.txt."
-    mPrintAt 6, 8,  "2. Type one letter at a time - correct letters turn green."
-    mPrintAt 6, 9,  "3. Each wrong letter costs a life and adds a part to the hangman."
-    mPrintAt 6, 10, "4. Reveal the whole word before you lose all 6 lives."
-    mColor lightCyan
-    mPrintAt 4, 12, "SCORING"
-    mColor lightGray
-    mPrintAt 6, 13, "+10 for every letter revealed in the word"
-    mPrintAt 6, 14, "+50 bonus for a win  plus  +20 for every life left"
-    mColor lightCyan
-    mPrintAt 4, 16, "FILES  (kept in the same folder as the program)"
-    mColor lightGray
-    mPrintAt 6, 17, "words.txt    the word list - edit in Notepad (one word per line)"
-    mPrintAt 6, 18, "stats.dat    saved statistics shown on the Dashboard"
-    mPrintAt 6, 19, "history.txt  a log line for every finished game"
-    mColor NORMAL_COLOR
-    mov  dh, 23
-    mov  dl, 2
-    call Gotoxy
-    call WaitMsg
-    ret
-HelpScreen ENDP
 
-;---------------------------------------------------------------------
-GoodbyeScreen PROC USES edx
-    mColor NORMAL_COLOR
-    call Clrscr
-    mColor lightBlue
-    INVOKE DrawBox, 19, 8, 42, 7
-    mColor yellow
-    mPrintAt 27, 10, "Thanks for playing HANGMAN"
-    mColor lightGray
-    mPrintAt 24, 12, "Your statistics have been saved."
-    mColor NORMAL_COLOR
-    mov  dh, 17
-    mov  dl, 19
-    call Gotoxy
-    call WaitMsg
-    ret
-GoodbyeScreen ENDP
+; ==============================================================
+;  FILE HANDLING
+; ==============================================================
 
-;=====================================================================
-;                          FILING MODULE
-;=====================================================================
-LoadWords PROC USES eax ebx ecx edx esi
-; Loads words.txt into wordTable.  If the file is missing it is created
-; from the built-in list; if it holds no valid words the built-in list
-; is used.
-    mov  wordCount, 0
-    mov  edx, OFFSET wordsFile
+; --------------------------------------------------------------
+;  LoadWords - reads words.txt into wordList.
+;  If the file is not found, it is created with the default words.
+; --------------------------------------------------------------
+LoadWords PROC
+    mov wordCount, 0
+
+    mov edx, OFFSET wordsFile
     call OpenInputFile
-    cmp  eax, INVALID_HANDLE_VALUE
-    je   LW_NoFile
-    mov  fileHandle, eax
-    mov  edx, OFFSET fileBuffer
-    mov  ecx, FILE_BUF - 1
-    call ReadFromFile                   ; EAX = bytes read, CF = error
-    jc   LW_ReadFail
-    mov  ebx, eax
-    mov  fileBuffer[ebx], 0
-    mov  eax, fileHandle
+    cmp eax, INVALID_HANDLE_VALUE
+    je  NoWordsFile
+    mov fileHandle, eax
+
+    mov eax, fileHandle
+    mov edx, OFFSET buffer
+    mov ecx, BUFFER_SIZE - 1
+    call ReadFromFile           ; EAX = number of bytes read
+    jc  ReadFailed
+    mov bytesRead, eax
+
+    mov eax, fileHandle
     call CloseFile
-    mov  esi, OFFSET fileBuffer
-    call ParseWordBuffer
-    cmp  wordCount, 0
-    ja   LW_Done
-    jmp  LW_BuiltIn
-LW_ReadFail:
-    mov  eax, fileHandle
+
+    mov ebx, bytesRead
+    mov buffer[ebx], 0          ; put 0 at the end of the text
+    mov esi, OFFSET buffer
+    call SplitWords
+
+    cmp wordCount, 0            ; file was empty?
+    jne LoadDone
+    jmp UseDefault
+
+ReadFailed:
+    mov eax, fileHandle
     call CloseFile
-    jmp  LW_BuiltIn
-LW_NoFile:                              ; create words.txt for the player
-    mov  edx, OFFSET wordsFile
+    jmp UseDefault
+
+NoWordsFile:
+    ; create words.txt so the player can edit it later
+    mov edx, OFFSET wordsFile
     call CreateOutputFile
-    cmp  eax, INVALID_HANDLE_VALUE
-    je   LW_BuiltIn
-    mov  fileHandle, eax
-    mov  edx, OFFSET defaultWords
-    call StrLength
-    mov  ecx, eax
-    mov  eax, fileHandle
-    call WriteToFile                    ; EDX still -> defaultWords
-    mov  eax, fileHandle
+    cmp eax, INVALID_HANDLE_VALUE
+    je  UseDefault
+    mov fileHandle, eax
+    mov eax, fileHandle
+    mov edx, OFFSET defaultWords
+    mov ecx, DEFAULT_LEN
+    call WriteToFile
+    mov eax, fileHandle
     call CloseFile
-LW_BuiltIn:
-    mov  wordCount, 0
-    mov  esi, OFFSET defaultWords
-    call ParseWordBuffer
-LW_Done:
+
+UseDefault:
+    mov wordCount, 0
+    mov esi, OFFSET defaultWords
+    call SplitWords
+
+LoadDone:
     ret
 LoadWords ENDP
 
-;---------------------------------------------------------------------
-ParseWordBuffer PROC USES eax ebx ecx edx esi
-; ESI -> null-terminated text.  Splits it on any non-letter, converts
-; to upper case and appends every 3..15-letter word as a new row of
-; wordTable (row address = wordTable + wordCount*16 + column).
-    xor  ecx, ecx                       ; letters in the current word
-    xor  edx, edx                       ; 1 = current word is too long
-PWB_Next:
-    cmp  wordCount, MAX_WORDS
-    jae  PWB_Done
-    mov  al, [esi]
-    inc  esi
-    cmp  al, 'a'
-    jb   PWB_Upper
-    cmp  al, 'z'
-    ja   PWB_Sep
-    sub  al, 32
-    jmp  PWB_Letter
-PWB_Upper:
-    cmp  al, 'A'
-    jb   PWB_Sep
-    cmp  al, 'Z'
-    ja   PWB_Sep
-PWB_Letter:
-    cmp  ecx, WORD_SIZE - 1
-    jb   PWB_Store
-    mov  edx, 1
-    jmp  PWB_Next
-PWB_Store:
-    mov  ebx, wordCount
-    shl  ebx, 4
-    add  ebx, ecx
-    mov  wordTable[ebx], al
-    inc  ecx
-    jmp  PWB_Next
-PWB_Sep:                                ; end of a word (or of the text)
-    cmp  ecx, MIN_WORD
-    jb   PWB_Reset
-    cmp  edx, 0
-    jne  PWB_Reset
-    mov  ebx, wordCount
-    shl  ebx, 4
-    add  ebx, ecx
-    mov  wordTable[ebx], 0              ; terminate the row
-    inc  wordCount
-PWB_Reset:
-    xor  ecx, ecx
-    xor  edx, edx
-    cmp  al, 0
-    jne  PWB_Next
-PWB_Done:
-    ret
-ParseWordBuffer ENDP
 
-;---------------------------------------------------------------------
-LoadStats PROC USES eax ecx edx
-    mov  edx, OFFSET statsFile
-    call OpenInputFile
-    cmp  eax, INVALID_HANDLE_VALUE
-    je   LS_Done                        ; first run: keep zeros
-    mov  fileHandle, eax
-    mov  edx, OFFSET statsBlock
-    mov  ecx, STATS_SIZE
-    call ReadFromFile
-    jc   LS_Bad
-    cmp  eax, STATS_SIZE
-    jne  LS_Bad
-    mov  eax, fileHandle
-    call CloseFile
+; --------------------------------------------------------------
+;  SplitWords - breaks the text at ESI into words and stores them
+;  in wordList. Any character that is not a letter ends a word.
+;  Words shorter than 3 letters are ignored.
+;  Address of a letter = wordList + (wordCount * 16) + position
+; --------------------------------------------------------------
+SplitWords PROC
+    mov ecx, 0                  ; ECX = letters in the current word
+
+NextChar:
+    mov al, [esi]
+    inc esi
+
+    cmp al, 'a'                 ; small letter?  make it capital
+    jb  IsCapital
+    cmp al, 'z'
+    ja  EndOfWord
+    sub al, 32
+IsCapital:
+    cmp al, 'A'
+    jb  EndOfWord
+    cmp al, 'Z'
+    ja  EndOfWord
+
+    ; it is a letter - store it (extra letters after 15 are skipped)
+    cmp ecx, WORD_SIZE - 1
+    jae NextChar
+    mov ebx, wordCount
+    shl ebx, 4                  ; EBX = wordCount * 16
+    add ebx, ecx
+    mov wordList[ebx], al
+    inc ecx
+    jmp NextChar
+
+EndOfWord:
+    cmp ecx, 3                  ; too short?  ignore it
+    jb  ResetWord
+    mov ebx, wordCount
+    shl ebx, 4
+    add ebx, ecx
+    mov wordList[ebx], 0        ; end the word with 0
+    inc wordCount
+
+ResetWord:
+    mov ecx, 0
+    cmp wordCount, MAX_WORDS    ; list full?
+    jae SplitDone
+    cmp al, 0                   ; end of text?
+    jne NextChar
+
+SplitDone:
     ret
-LS_Bad:
-    mov  eax, fileHandle
+SplitWords ENDP
+
+
+; --------------------------------------------------------------
+;  LoadStats - reads the 5 statistics DWORDs from stats.dat
+; --------------------------------------------------------------
+LoadStats PROC
+    mov edx, OFFSET statsFile
+    call OpenInputFile
+    cmp eax, INVALID_HANDLE_VALUE
+    je  NoStats                 ; first time: keep zeros
+    mov fileHandle, eax
+
+    mov eax, fileHandle
+    mov edx, OFFSET statsData
+    mov ecx, STATS_BYTES
+    call ReadFromFile
+
+    mov eax, fileHandle
     call CloseFile
-    call ClearStats
-LS_Done:
+NoStats:
     ret
 LoadStats ENDP
 
-;---------------------------------------------------------------------
-SaveStats PROC USES eax ecx edx
-    mov  edx, OFFSET statsFile
+
+; --------------------------------------------------------------
+;  SaveStats - writes the 5 statistics DWORDs to stats.dat
+; --------------------------------------------------------------
+SaveStats PROC
+    mov edx, OFFSET statsFile
     call CreateOutputFile
-    cmp  eax, INVALID_HANDLE_VALUE
-    je   SS_Done
-    mov  fileHandle, eax
-    mov  edx, OFFSET statsBlock
-    mov  ecx, STATS_SIZE
+    cmp eax, INVALID_HANDLE_VALUE
+    je  SaveDone
+    mov fileHandle, eax
+
+    mov eax, fileHandle
+    mov edx, OFFSET statsData
+    mov ecx, STATS_BYTES
     call WriteToFile
-    mov  eax, fileHandle
+
+    mov eax, fileHandle
     call CloseFile
-SS_Done:
+SaveDone:
     ret
 SaveStats ENDP
-
-;---------------------------------------------------------------------
-ClearStats PROC USES eax ecx edi
-    cld
-    mov  edi, OFFSET statsBlock
-    mov  ecx, STATS_SIZE
-    mov  al, 0
-    rep  stosb
-    ret
-ClearStats ENDP
-
-;---------------------------------------------------------------------
-LogHistory PROC USES eax ebx ecx esi edi
-; Appends e.g.  "Game #12     WIN    COMPUTER        Score: 140   Lives left: 3"
-    cld
-    mov  edi, OFFSET lineBuf
-    mov  esi, OFFSET hGame
-    call CopyStr
-    mov  ebx, edi
-    mov  eax, gPlayed
-    call NumToStr
-    mov  ecx, ebx                       ; pad game number to 5 columns
-    add  ecx, 5
-    sub  ecx, edi
-    cmp  ecx, 0
-    jle  LH_NoPad
-    mov  al, ' '
-    rep  stosb
-LH_NoPad:
-    mov  esi, OFFSET hWin
-    cmp  roundResult, 1
-    je   LH_Res
-    mov  esi, OFFSET hLoss
-LH_Res:
-    call CopyStr
-    mov  esi, OFFSET secretWord
-    call CopyStr
-    mov  ecx, WORD_SIZE                 ; pad word to 16 columns
-    sub  ecx, wordLen
-    mov  al, ' '
-    rep  stosb
-    mov  esi, OFFSET hScore
-    call CopyStr
-    mov  eax, roundScore
-    call NumToStr
-    mov  esi, OFFSET hLives
-    call CopyStr
-    mov  eax, lives
-    call NumToStr
-    mov  BYTE PTR [edi], 0Dh
-    mov  BYTE PTR [edi+1], 0Ah
-    add  edi, 2
-    mov  ecx, edi
-    sub  ecx, OFFSET lineBuf
-    INVOKE AppendText, ADDR histFile, ADDR lineBuf, ecx
-    ret
-LogHistory ENDP
-
-;---------------------------------------------------------------------
-AppendText PROC USES eax ecx edx, pFile:PTR BYTE, pText:PTR BYTE, nLen:DWORD
-; Opens (or creates) a file, moves to its end and writes nLen bytes.
-    LOCAL hFile:DWORD
-    INVOKE CreateFile, pFile, MY_GENERIC_WRITE, MY_SHARE_READ, 0, MY_OPEN_ALWAYS, MY_ATTR_NORMAL, 0
-    cmp  eax, INVALID_HANDLE_VALUE
-    je   AT_Done
-    mov  hFile, eax
-    INVOKE SetFilePointer, hFile, 0, 0, MY_FILE_END
-    mov  eax, hFile
-    mov  edx, pText
-    mov  ecx, nLen
-    call WriteToFile
-    mov  eax, hFile
-    call CloseFile
-AT_Done:
-    ret
-AppendText ENDP
-
-;=====================================================================
-;                       STRING HELPERS
-;=====================================================================
-CopyStr PROC USES eax
-; Copies the null-terminated string at ESI to EDI (without the null).
-; EDI is left just after the copied text.
-CS_Loop:
-    lodsb
-    cmp  al, 0
-    je   CS_Done
-    stosb
-    jmp  CS_Loop
-CS_Done:
-    ret
-CopyStr ENDP
-
-;---------------------------------------------------------------------
-NumToStr PROC USES eax ebx edx
-; RECURSIVE: writes the unsigned decimal value of EAX at EDI and
-; advances EDI.   n -> NumToStr(n / 10), then the digit n mod 10.
-    mov  ebx, 10
-    xor  edx, edx
-    div  ebx                            ; EAX = n / 10, EDX = n mod 10
-    cmp  eax, 0
-    je   NTS_Digit
-    call NumToStr                       ; print the higher digits first
-NTS_Digit:
-    add  dl, '0'
-    mov  [edi], dl
-    inc  edi
-    ret
-NumToStr ENDP
 
 END main
